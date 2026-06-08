@@ -6,34 +6,182 @@ import matplotlib.pyplot
 
 _global_counter = 0
 
-def visualize_predictions(images, labels, predictions, label_colors, visualize_path=None):
+
+def safe_filename(text):
+    text = str(text)
+    keep = []
+    for ch in text:
+        if ch.isalnum() or ch in ['-', '_', '.']:
+            keep.append(ch)
+        else:
+            keep.append('_')
+    name = ''.join(keep).strip('_')
+    return name if name else 'sample'
+
+
+def unique_path(path):
+    """Return a non-existing path by adding _001, _002, ... if needed."""
+    path = str(path)
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    idx = 1
+    while True:
+        candidate = f"{root}_{idx:03d}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
+def make_color_map(num_classes):
+    base = [
+        (0, 0, 0),
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+        (255, 255, 0),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 128, 0),
+        (128, 0, 255),
+        (255, 255, 255),
+    ]
+    return {i: base[i % len(base)] for i in range(num_classes)}
+
+
+def mask_to_overlay(img, mask, label_colors, alpha=0.45):
+    h, w = img.shape[:2]
+    overlay = numpy.zeros((h, w, 3), dtype=numpy.uint8)
+    for c, color in label_colors.items():
+        overlay[mask == c] = color
+    return cv2.addWeighted(img, 1.0 - alpha, overlay, alpha, 0)
+
+
+def find_error_bbox(gt_mask, pred_mask, target_classes=None, min_size=32, pad=18):
+    if target_classes is None:
+        # Prefer thin classes if DDOS label order is used: Thin Structures=6, Ultra-thin=7.
+        target_classes = [6, 7]
+
+    error = numpy.zeros(gt_mask.shape, dtype=bool)
+    for c in target_classes:
+        error |= (gt_mask == c) | (pred_mask == c)
+    error &= (gt_mask != pred_mask)
+
+    if error.sum() == 0:
+        error = gt_mask != pred_mask
+    if error.sum() == 0:
+        h, w = gt_mask.shape
+        return 0, 0, w, h
+
+    ys, xs = numpy.where(error)
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(gt_mask.shape[1] - 1, x2 + pad)
+    y2 = min(gt_mask.shape[0] - 1, y2 + pad)
+
+    if x2 - x1 < min_size:
+        extra = (min_size - (x2 - x1)) // 2
+        x1 = max(0, x1 - extra)
+        x2 = min(gt_mask.shape[1] - 1, x2 + extra)
+    if y2 - y1 < min_size:
+        extra = (min_size - (y2 - y1)) // 2
+        y1 = max(0, y1 - extra)
+        y2 = min(gt_mask.shape[0] - 1, y2 + extra)
+
+    return x1, y1, x2, y2
+
+
+def draw_bbox(image, bbox, color=(255, 0, 0), thickness=2):
+    out = image.copy()
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+    return out
+
+
+def visualize_predictions(images, labels, predictions, label_colors=None, visualize_path=None, metadata=None,
+                          max_images=None, make_zoom=True, target_classes=None):
+    """
+    Saves improved qualitative figures:
+    1) RGB with red box, ground truth overlay, prediction overlay
+    2) zoomed RGB, zoomed ground truth, zoomed prediction
+
+    This helps support the paper's qualitative and failure-analysis claims.
+    """
     global _global_counter
+
     preds = torch.argmax(predictions, dim=1).cpu().numpy()
     imgs = images.permute(0, 2, 3, 1).cpu().numpy()
+    labels_np = labels.cpu().numpy()
+
+    if label_colors is None:
+        label_colors = make_color_map(predictions.shape[1])
+
     if visualize_path:
         os.makedirs(visualize_path, exist_ok=True)
+
+    saved_in_this_call = 0
     for i in range(len(imgs)):
-        img = (imgs[i][:, :, :3] * 255).astype(numpy.uint8)
-        gt_mask = labels[i].cpu().numpy()
+        # Limit the number of images for this call/batch, but do not let a previous
+        # model/modality prevent later models from saving visualizations.
+        if max_images is not None and max_images >= 0 and saved_in_this_call >= max_images:
+            return
+
+        img = (imgs[i][:, :, :3] * 255).clip(0, 255).astype(numpy.uint8)
+        gt_mask = labels_np[i]
         pred_mask = preds[i]
-        h, w = img.shape[:2]
-        overlay_pred = numpy.zeros((h, w, 3), dtype=numpy.uint8)
-        overlay_gt = numpy.zeros((h, w, 3), dtype=numpy.uint8)
-        for c, color in label_colors.items():
-            overlay_pred[pred_mask == c] = color
-            overlay_gt[gt_mask == c] = color
-        blended_pred = cv2.addWeighted(img, 0.6, overlay_pred, 0.4, 0)
-        blended_gt = cv2.addWeighted(img, 0.6, overlay_gt, 0.4, 0)
-        fig, axes = matplotlib.pyplot.subplots(1, 2, figsize=(12, 6))
-        axes[0].imshow(blended_gt)
-        axes[0].set_title("Ground Truth")
-        axes[0].axis("off")
-        axes[1].imshow(blended_pred)
-        axes[1].set_title("Prediction")
-        axes[1].axis("off")
+
+        gt_overlay = mask_to_overlay(img, gt_mask, label_colors)
+        pred_overlay = mask_to_overlay(img, pred_mask, label_colors)
+
+        bbox = find_error_bbox(gt_mask, pred_mask, target_classes=target_classes)
+        img_box = draw_bbox(img, bbox)
+        gt_box = draw_bbox(gt_overlay, bbox)
+        pred_box = draw_bbox(pred_overlay, bbox)
+
+        if make_zoom:
+            x1, y1, x2, y2 = bbox
+            zoom_rgb = img[y1:y2 + 1, x1:x2 + 1]
+            zoom_gt = gt_overlay[y1:y2 + 1, x1:x2 + 1]
+            zoom_pred = pred_overlay[y1:y2 + 1, x1:x2 + 1]
+            fig, axes = matplotlib.pyplot.subplots(2, 3, figsize=(13, 8))
+            panels = [img_box, gt_box, pred_box, zoom_rgb, zoom_gt, zoom_pred]
+            titles = ["RGB with error/thin-object box", "Ground truth", "Prediction",
+                      "Zoomed RGB", "Zoomed ground truth", "Zoomed prediction"]
+            for ax, panel, title in zip(axes.ravel(), panels, titles):
+                ax.imshow(panel)
+                ax.set_title(title)
+                ax.axis("off")
+        else:
+            fig, axes = matplotlib.pyplot.subplots(1, 3, figsize=(13, 4))
+            panels = [img_box, gt_box, pred_box]
+            titles = ["RGB with box", "Ground truth", "Prediction"]
+            for ax, panel, title in zip(axes, panels, titles):
+                ax.imshow(panel)
+                ax.set_title(title)
+                ax.axis("off")
+
+        if metadata is not None and i < len(metadata):
+            sample_key = metadata[i].get("sample_key", f"sample_{_global_counter}")
+            fig.suptitle(f"Qualitative/failure example: {sample_key}", fontsize=11)
+
         if visualize_path:
-            out_file = os.path.join(visualize_path, f"vis_{_global_counter}.png")
-            matplotlib.pyplot.savefig(out_file, bbox_inches="tight")
+            if metadata is not None and i < len(metadata):
+                sample_key = safe_filename(metadata[i].get("sample_key", f"sample_{_global_counter}"))
+            else:
+                sample_key = f"sample_{_global_counter}"
+
+            # Include sample_key and a counter in the filename. unique_path() prevents
+            # overwriting even if the script is re-run and the counter starts from zero.
+            out_file = os.path.join(
+                visualize_path,
+                f"vis_zoom_failure_{_global_counter:04d}_{sample_key}.png"
+            )
+            out_file = unique_path(out_file)
+            matplotlib.pyplot.savefig(out_file, bbox_inches="tight", dpi=200)
             print(f"[INFO] Saved {out_file}")
-        matplotlib.pyplot.close()
+        matplotlib.pyplot.close(fig)
         _global_counter += 1
+        saved_in_this_call += 1

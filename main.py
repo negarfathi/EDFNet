@@ -1,5 +1,7 @@
 # REQUIREMENTS:
 # pip install -r requirements.txt
+# Optional stronger baselines require a recent segmentation_models_pytorch version:
+# pip install -U segmentation-models-pytorch timm
 
 # DATASET:
 # git lfs install
@@ -12,42 +14,55 @@
 #   --include "data/*/neighbourhood/0/*" \
 #   --exclude "data/*/neighbourhood/[1-9]*/*"
 
-
-# EXECUTION:
-# python main.py --modality <rgb/rgbd/rgbe/rgbde/all> --model <unet/unet_pretrained/deeplabv3/deeplabv3_pretrained/all> --device <cpu/cuda> --dataset <path/to/training_dataset> --train --test --visualize --edge_method <canny/sobel> --epochs <num_epochs> --batch_size <batch_size> --learning_rate <learning_rate>
+# EXECUTION EXAMPLES:
 # python main.py --modality all --model all --device cuda --dataset ./data/DDOS --train --test --visualize --edge_method sobel --epochs 50 --batch_size 16 --learning_rate 5e-4
-# OR
-# python main.py --modality all --model all --device cpu --dataset ./data/DDOS --train --test --visualize --edge_method sobel --epochs 25 --batch_size 8 --learning_rate 1e-4
+# python main.py --modality all --model deeplabv3plus_pretrained --device cuda --dataset ./data/DDOS --train --test --visualize --edge_method sobel --epochs 50 --batch_size 16 --learning_rate 5e-4
+# python main.py --modality all --model segformer_pretrained --device cuda --dataset ./data/DDOS --train --test --visualize --edge_method sobel --epochs 50 --batch_size 16 --learning_rate 5e-4
 
 import os
 import argparse
 from src.train import train_model
-from src.test import test_model
+from src.test import test_model, summarize_results
+from src.dataset import export_dataset_class_statistics
+
+
+SUPPORTED_MODELS = [
+    "unet",
+    "unet_pretrained",
+    "deeplabv3",
+    "deeplabv3_pretrained",
+    "deeplabv3plus",
+    "deeplabv3plus_pretrained",
+    "segformer_pretrained",
+    "all",
+]
+
+SUPPORTED_MODALITIES = ["rgb", "rgbd", "rgbe", "rgbde", "all"]
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EDFNet: Early Fusion for Thin-Obstacle Segmentation")
-    parser.add_argument("--modality", type=str, choices=["rgb", "rgbd", "rgbe", "rgbde", "all"],
+    parser.add_argument("--modality", type=str, choices=SUPPORTED_MODALITIES, required=True,
                         help="Modality configuration: RGB, RGB+D, RGB+E, RGB+D+E, or all.")
-    parser.add_argument("--model", type=str, choices=["unet", "unet_pretrained", "deeplabv3", "deeplabv3_pretrained", "all"],
-                        help="Model architecture: U-Net, DeepLabV3, pretrained variants, or all.")
-    parser.add_argument("--device", type=str, choices=["cpu", "cuda"],
+    parser.add_argument("--model", type=str, choices=SUPPORTED_MODELS, required=True,
+                        help="Model architecture, pretrained variants, stronger baselines, or all.")
+    parser.add_argument("--device", type=str, choices=["cpu", "cuda"], required=True,
                         help="Computation device: CPU or CUDA.")
-    parser.add_argument("--dataset", type=str,
+    parser.add_argument("--dataset", type=str, required=True,
                         help="Path to dataset root directory.")
-    parser.add_argument("--train", action="store_true",
-                        help="Run training stage.")
-    parser.add_argument("--test", action="store_true",
-                        help="Run testing stage.")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Save visual results.")
-    parser.add_argument("--edge_method", type=str, choices=["canny", "sobel"],
+    parser.add_argument("--train", action="store_true", help="Run training stage.")
+    parser.add_argument("--test", action="store_true", help="Run testing stage.")
+    parser.add_argument("--visualize", action="store_true", help="Save visual results.")
+    parser.add_argument("--edge_method", type=str, choices=["canny", "sobel"], default="sobel",
                         help="Edge extraction method: canny or sobel.")
-    parser.add_argument("--epochs", type=int,
-                        help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int,
-                        help="Batch size for training and testing.")
-    parser.add_argument("--learning_rate", type=float,
-                        help="Learning rate for optimizer.")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training and testing.")
+    parser.add_argument("--learning_rate", type=float, default=5e-4, help="Learning rate for optimizer.")
+    parser.add_argument("--results_dir", type=str, default="results", help="Directory for CSV results and analysis files.")
+    parser.add_argument("--visualize_max", type=int, default=20,
+                        help="Maximum number of visualization images per model/modality. Use -1 for all.")
+    parser.add_argument("--export_class_stats", action="store_true",
+                        help="Export class-frequency tables for train/validation/test splits.")
     args = parser.parse_args()
 
     if args.modality == "all":
@@ -56,7 +71,9 @@ if __name__ == "__main__":
         modalities = [args.modality]
 
     if args.model == "all":
-        models = ["unet", "unet_pretrained", "deeplabv3", "deeplabv3_pretrained"]
+        # Keeps original 16 experiments and adds one stronger recent baseline.
+        # You can manually run deeplabv3plus/segformer if time permits.
+        models = ["unet", "unet_pretrained", "deeplabv3", "deeplabv3_pretrained", "deeplabv3plus_pretrained"]
     else:
         models = [args.model]
 
@@ -64,6 +81,14 @@ if __name__ == "__main__":
     train_path = os.path.join(dataset_path, "train")
     validation_path = os.path.join(dataset_path, "validation")
     test_path = os.path.join(dataset_path, "test")
+
+    os.makedirs(args.results_dir, exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
+
+    if args.export_class_stats:
+        export_dataset_class_statistics(train_path, os.path.join(args.results_dir, "class_frequency_train.csv"))
+        export_dataset_class_statistics(validation_path, os.path.join(args.results_dir, "class_frequency_validation.csv"))
+        export_dataset_class_statistics(test_path, os.path.join(args.results_dir, "class_frequency_test.csv"))
 
     for model in models:
         for modality in modalities:
@@ -77,12 +102,18 @@ if __name__ == "__main__":
                             edge_method=args.edge_method,
                             epochs=args.epochs,
                             batch_size=args.batch_size,
-                            learning_rate=args.learning_rate)
+                            learning_rate=args.learning_rate,
+                            results_dir=args.results_dir)
             if args.test:
                 test_model(test_path=test_path,
                            modality=modality,
                            device=args.device,
-                           edge_method = args.edge_method,
+                           edge_method=args.edge_method,
                            checkpoint_path=checkpoint_path,
                            batch_size=args.batch_size,
-                           visualize=args.visualize)
+                           visualize=args.visualize,
+                           results_dir=args.results_dir,
+                           visualize_max=args.visualize_max)
+
+    if args.test:
+        summarize_results(args.results_dir)
