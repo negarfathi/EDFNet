@@ -137,4 +137,4 @@ visualizations/<model_name>_<modality>/
 
 This repository is based on the following work:
 
-N. Fathi, “EDFNet: Early Fusion of Edge and Depth for Thin-Obstacle Segmentation in UAV Navigation,” *arXiv* preprint, [arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX.XXXXX), 2026.
+N. Fathi, “EDFNet: Early Fusion of Edge and Depth for Thin-Obstacle Segmentation in UAV Navigation,” *arXiv preprint* [arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX.XXXXX), 2026.
