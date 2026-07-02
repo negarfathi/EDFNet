@@ -4,6 +4,8 @@ import numpy
 import torch
 import matplotlib.pyplot
 
+from src.dataset import IMAGENET_MEAN, IMAGENET_STD, get_thin_class_indices
+
 _global_counter = 0
 
 
@@ -11,12 +13,12 @@ def safe_filename(text):
     text = str(text)
     keep = []
     for ch in text:
-        if ch.isalnum() or ch in ['-', '_', '.']:
+        if ch.isalnum() or ch in ["-", "_", "."]:
             keep.append(ch)
         else:
-            keep.append('_')
-    name = ''.join(keep).strip('_')
-    return name if name else 'sample'
+            keep.append("_")
+    name = "".join(keep).strip("_")
+    return name if name else "sample"
 
 
 def unique_path(path):
@@ -49,6 +51,16 @@ def make_color_map(num_classes):
     return {i: base[i % len(base)] for i in range(num_classes)}
 
 
+def denormalize_rgb_for_display(img):
+    """Convert the first three channels of a model input back to [0,255] RGB."""
+    img = img[:, :, :3].astype(numpy.float32).copy()
+    # Pretrained inputs have ImageNet-normalized RGB, which usually includes
+    # negative values or values > 1. Reverse it for visualization.
+    if img.min() < -0.01 or img.max() > 1.01:
+        img = img * IMAGENET_STD.reshape(1, 1, 3) + IMAGENET_MEAN.reshape(1, 1, 3)
+    return (img * 255.0).clip(0, 255).astype(numpy.uint8)
+
+
 def mask_to_overlay(img, mask, label_colors, alpha=0.45):
     h, w = img.shape[:2]
     overlay = numpy.zeros((h, w, 3), dtype=numpy.uint8)
@@ -59,8 +71,7 @@ def mask_to_overlay(img, mask, label_colors, alpha=0.45):
 
 def find_error_bbox(gt_mask, pred_mask, target_classes=None, min_size=32, pad=18):
     if target_classes is None:
-        # Prefer thin classes if DDOS label order is used: Thin Structures=6, Ultra-thin=7.
-        target_classes = [6, 7]
+        target_classes = get_thin_class_indices()
 
     error = numpy.zeros(gt_mask.shape, dtype=bool)
     for c in target_classes:
@@ -104,11 +115,9 @@ def draw_bbox(image, bbox, color=(255, 0, 0), thickness=2):
 def visualize_predictions(images, labels, predictions, label_colors=None, visualize_path=None, metadata=None,
                           max_images=None, make_zoom=True, target_classes=None):
     """
-    Saves improved qualitative figures:
-    1) RGB with red box, ground truth overlay, prediction overlay
-    2) zoomed RGB, zoomed ground truth, zoomed prediction
-
-    This helps support the paper's qualitative and failure-analysis claims.
+    Save qualitative figures and return the number of images saved in this call.
+    max_images is now a caller-provided remaining budget, so the total cap can be
+    enforced once per model/modality instead of once per batch.
     """
     global _global_counter
 
@@ -119,17 +128,18 @@ def visualize_predictions(images, labels, predictions, label_colors=None, visual
     if label_colors is None:
         label_colors = make_color_map(predictions.shape[1])
 
+    if target_classes is None:
+        target_classes = get_thin_class_indices()
+
     if visualize_path:
         os.makedirs(visualize_path, exist_ok=True)
 
     saved_in_this_call = 0
     for i in range(len(imgs)):
-        # Limit the number of images for this call/batch, but do not let a previous
-        # model/modality prevent later models from saving visualizations.
         if max_images is not None and max_images >= 0 and saved_in_this_call >= max_images:
-            return
+            return saved_in_this_call
 
-        img = (imgs[i][:, :, :3] * 255).clip(0, 255).astype(numpy.uint8)
+        img = denormalize_rgb_for_display(imgs[i])
         gt_mask = labels_np[i]
         pred_mask = preds[i]
 
@@ -148,7 +158,7 @@ def visualize_predictions(images, labels, predictions, label_colors=None, visual
             zoom_pred = pred_overlay[y1:y2 + 1, x1:x2 + 1]
             fig, axes = matplotlib.pyplot.subplots(2, 3, figsize=(13, 8))
             panels = [img_box, gt_box, pred_box, zoom_rgb, zoom_gt, zoom_pred]
-            titles = ["RGB with error/thin-object box", "Ground truth", "Prediction",
+            titles = ["RGB with thin/error box", "Ground truth", "Prediction",
                       "Zoomed RGB", "Zoomed ground truth", "Zoomed prediction"]
             for ax, panel, title in zip(axes.ravel(), panels, titles):
                 ax.imshow(panel)
@@ -156,7 +166,7 @@ def visualize_predictions(images, labels, predictions, label_colors=None, visual
                 ax.axis("off")
         else:
             fig, axes = matplotlib.pyplot.subplots(1, 3, figsize=(13, 4))
-            panels = [img_box, gt_box, pred_box]
+            panels = [img_box, gt_overlay, pred_overlay]
             titles = ["RGB with box", "Ground truth", "Prediction"]
             for ax, panel, title in zip(axes, panels, titles):
                 ax.imshow(panel)
@@ -173,8 +183,6 @@ def visualize_predictions(images, labels, predictions, label_colors=None, visual
             else:
                 sample_key = f"sample_{_global_counter}"
 
-            # Include sample_key and a counter in the filename. unique_path() prevents
-            # overwriting even if the script is re-run and the counter starts from zero.
             out_file = os.path.join(
                 visualize_path,
                 f"vis_zoom_failure_{_global_counter:04d}_{sample_key}.png"
@@ -185,3 +193,5 @@ def visualize_predictions(images, labels, predictions, label_colors=None, visual
         matplotlib.pyplot.close(fig)
         _global_counter += 1
         saved_in_this_call += 1
+
+    return saved_in_this_call

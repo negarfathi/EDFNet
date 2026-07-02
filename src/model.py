@@ -68,27 +68,96 @@ class UNet(torch.nn.Module):
         return self.output_conv(d1)
 
 
+def _deeplabv3_resnet50_no_pretraining():
+    """Create a fully non-pretrained DeepLabV3-ResNet50 across torchvision versions."""
+    try:
+        return torchvision.models.segmentation.deeplabv3_resnet50(weights=None, weights_backbone=None)
+    except TypeError:
+        # Older torchvision used pretrained_backbone.
+        return torchvision.models.segmentation.deeplabv3_resnet50(
+            weights=None,
+            pretrained_backbone=False,
+        )
+
+
+def _adapt_first_conv(conv, in_channels, keep_pretrained_rgb=True):
+    if conv.in_channels == in_channels:
+        return conv
+
+    new_conv = torch.nn.Conv2d(
+        in_channels,
+        conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=(conv.bias is not None),
+        padding_mode=conv.padding_mode,
+    )
+
+    if keep_pretrained_rgb and conv.in_channels == 3 and in_channels >= 3:
+        with torch.no_grad():
+            new_conv.weight[:, :3, :, :] = conv.weight
+            if in_channels > 3:
+                extra = conv.weight.mean(dim=1, keepdim=True)
+                for c in range(3, in_channels):
+                    new_conv.weight[:, c:c + 1, :, :] = extra
+            if conv.bias is not None and new_conv.bias is not None:
+                new_conv.bias.copy_(conv.bias)
+
+    return new_conv
+
+
 class DeepLabV3ResNet50(torch.nn.Module):
     def __init__(self, num_classes, in_channels, pretrained=False):
         super().__init__()
         if pretrained:
-            self.model = torchvision.models.segmentation.deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
+            self.model = torchvision.models.segmentation.deeplabv3_resnet50(
+                weights=DeepLabV3_ResNet50_Weights.DEFAULT
+            )
         else:
-            self.model = torchvision.models.segmentation.deeplabv3_resnet50(weights=None)
+            self.model = _deeplabv3_resnet50_no_pretraining()
 
         original_conv = self.model.backbone.conv1
-        self.model.backbone.conv1 = torch.nn.Conv2d(
-            in_channels,
-            original_conv.out_channels,
-            kernel_size=7,
-            stride=2,
-            padding=3,
-            bias=False
+        self.model.backbone.conv1 = _adapt_first_conv(
+            original_conv,
+            in_channels=in_channels,
+            keep_pretrained_rgb=pretrained,
         )
+
         self.model.classifier[4] = torch.nn.Conv2d(256, num_classes, kernel_size=1)
+        if getattr(self.model, "aux_classifier", None) is not None:
+            try:
+                self.model.aux_classifier[4] = torch.nn.Conv2d(256, num_classes, kernel_size=1)
+            except Exception:
+                pass
 
     def forward(self, x):
         return self.model(x)["out"]
+
+
+
+def _get_segformer_class():
+    """Return the SegFormer class across segmentation_models_pytorch naming variants."""
+    if hasattr(segmentation_models_pytorch, "Segformer"):
+        return segmentation_models_pytorch.Segformer
+    if hasattr(segmentation_models_pytorch, "SegFormer"):
+        return segmentation_models_pytorch.SegFormer
+    return None
+
+
+def validate_model_availability(model_names):
+    """Fail early before long benchmark runs if a requested optional model is unavailable."""
+    requested = {m.lower() for m in model_names}
+    if ({"segformer", "segformer_pretrained"} & requested) and _get_segformer_class() is None:
+        version = getattr(segmentation_models_pytorch, "__version__", "unknown")
+        raise RuntimeError(
+            "SegFormer was requested, but this segmentation_models_pytorch installation "
+            f"does not expose Segformer/SegFormer (version={version}). "
+            "Install a recent version with `pip install -U segmentation-models-pytorch timm`, "
+            "then rerun. The fixed benchmark intentionally includes SegFormer in --model all."
+        )
 
 
 def build_model(model_name, num_classes, in_channels):
@@ -111,7 +180,6 @@ def build_model(model_name, num_classes, in_channels):
     if model_name == "deeplabv3_pretrained":
         return DeepLabV3ResNet50(num_classes=num_classes, in_channels=in_channels, pretrained=True)
 
-    # Stronger, low-code baseline using the same segmentation_models_pytorch dependency.
     if model_name == "deeplabv3plus":
         return segmentation_models_pytorch.DeepLabV3Plus(
             encoder_name="resnet34",
@@ -128,17 +196,19 @@ def build_model(model_name, num_classes, in_channels):
             classes=num_classes,
         )
 
-    # Optional modern baseline. This requires a recent segmentation_models_pytorch version.
-    # If your installed version does not support Segformer, use deeplabv3plus_pretrained instead.
-    if model_name == "segformer_pretrained":
-        if not hasattr(segmentation_models_pytorch, "Segformer"):
+    # Modern transformer baseline. Both scratch and ImageNet-pretrained variants are
+    # included so SegFormer is symmetric with UNet/DeepLabV3/DeepLabV3Plus.
+    if model_name in ["segformer", "segformer_pretrained"]:
+        segformer_class = _get_segformer_class()
+        if segformer_class is None:
+            version = getattr(segmentation_models_pytorch, "__version__", "unknown")
             raise RuntimeError(
-                "Your segmentation_models_pytorch version does not provide Segformer. "
-                "Run `pip install -U segmentation-models-pytorch timm`, or use deeplabv3plus_pretrained."
+                f"{model_name} was requested, but segmentation_models_pytorch does not provide "
+                f"Segformer/SegFormer (version={version}). Run `pip install -U segmentation-models-pytorch timm`."
             )
-        return segmentation_models_pytorch.Segformer(
+        return segformer_class(
             encoder_name="mit_b0",
-            encoder_weights="imagenet",
+            encoder_weights="imagenet" if model_name == "segformer_pretrained" else None,
             in_channels=in_channels,
             classes=num_classes,
         )
