@@ -133,7 +133,7 @@ visualizations/<model_name>_<modality>/
 
 
 
-## Preprints
+## Related Papers
 
 This repository is based on the following work:
 
