@@ -117,6 +117,7 @@ class DDOSDataset(Dataset):
         self.num_classes = len(self.class_ids)
 
         self.class_pixel_counts = Counter({cid: 0 for cid in self.class_ids})
+        self.class_image_counts = Counter({cid: 0 for cid in self.class_ids})
         self.observed_unknown_class_counts = Counter()
         for mask_path in self.mask_images:
             mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
@@ -125,12 +126,16 @@ class DDOSDataset(Dataset):
             if mask.ndim == 3:
                 mask = mask[:, :, 0]
             unique_classes, pixels_per_class = numpy.unique(mask, return_counts=True)
+            present_known_ids = set()
             for class_id, pixel_count in zip(unique_classes, pixels_per_class):
                 class_id = int(class_id)
                 if class_id in self.class_to_index:
                     self.class_pixel_counts[class_id] += int(pixel_count)
+                    present_known_ids.add(class_id)
                 else:
                     self.observed_unknown_class_counts[class_id] += int(pixel_count)
+            for class_id in present_known_ids:
+                self.class_image_counts[class_id] += 1
 
         if self.observed_unknown_class_counts and self.unknown_label_policy == "error":
             raise ValueError(
@@ -201,20 +206,25 @@ class DDOSDataset(Dataset):
         weights[~positive] = 0.0
         return [float(w) for w in weights]
 
-    def class_frequency_rows(self):
+    def class_frequency_rows(self, split=None):
         rows = []
+        num_images = max(1, len(self.mask_images))
         for idx, class_id in enumerate(self.class_ids):
-            count = self.class_pixel_counts[class_id]
+            count = int(self.class_pixel_counts[class_id])
             percent = 100.0 * count / max(1, self.total_pixels)
-            rows.append({
-                "mapped_index": idx,
-                "original_class_id": class_id,
+            images_with_class = int(self.class_image_counts[class_id])
+            row = {
+                "class_id": class_id,
                 "class_name": self.class_names[idx],
+                "is_thin_class": int(class_id in THIN_CLASS_IDS),
                 "pixel_count": count,
                 "pixel_percent": percent,
-                "raw_class_weight": self.raw_class_weights[idx],
-                "class_weight": self.class_weights[idx],
-            })
+                "num_images_with_class": images_with_class,
+                "image_percent_with_class": 100.0 * images_with_class / num_images,
+            }
+            if split is not None:
+                row = {"split": split, **row}
+            rows.append(row)
         return rows
 
     def save_class_frequency_csv(self, output_csv):
@@ -227,13 +237,13 @@ class DDOSDataset(Dataset):
         print(f"[INFO] Saved class-frequency table: {output_csv}")
 
     def print_class_frequency(self):
-        print("\n[Class frequency]")
+        print("\n[Class distribution]")
         for row in self.class_frequency_rows():
             print(
-                f"{row['mapped_index']:02d} | {row['class_name']:<16} | "
-                f"orig_id={row['original_class_id']:<3} | pixels={row['pixel_count']:<12} | "
-                f"{row['pixel_percent']:.6f}% | raw_w={row['raw_class_weight']:.4f} | "
-                f"w={row['class_weight']:.4f}"
+                f"{row['class_id']:<3} | {row['class_name']:<16} | "
+                f"pixels={row['pixel_count']:<12} | {row['pixel_percent']:.6f}% | "
+                f"images={row['num_images_with_class']:<6} | "
+                f"{row['image_percent_with_class']:.3f}%"
             )
 
     def extract_edges(self, rgb_image):
@@ -376,8 +386,36 @@ class DDOSDataset(Dataset):
         return input_tensor, target_tensor
 
 
-def export_dataset_class_statistics(dataset_path, output_csv, modality="rgb", edge_method="sobel"):
+def export_dataset_class_statistics(dataset_path, output_csv, modality="rgb", edge_method="sobel", split=None):
+    """Backward-compatible helper for writing one split's class distribution."""
     dataset = DDOSDataset(dataset_path=dataset_path, modality=modality, edge_method=edge_method, augment=False)
     dataset.print_class_frequency()
-    dataset.save_class_frequency_csv(output_csv)
+    rows = dataset.class_frequency_rows(split=split)
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[INFO] Saved class distribution table: {output_csv}")
+    return output_csv
+
+
+def export_dataset_class_distribution(split_paths, output_csv, modality="rgb", edge_method="sobel"):
+    """
+    Write one combined dataset distribution CSV for train/validation/test.
+
+    split_paths should map split names to DDOS split folders, for example:
+    {"train": ".../train", "validation": ".../validation", "test": ".../test"}
+    """
+    all_rows = []
+    for split, path in split_paths.items():
+        dataset = DDOSDataset(dataset_path=path, modality=modality, edge_method=edge_method, augment=False)
+        all_rows.extend(dataset.class_frequency_rows(split=split))
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    if all_rows:
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_rows)
+    print(f"[INFO] Saved dataset class distribution: {output_csv}")
     return output_csv

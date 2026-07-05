@@ -1,21 +1,24 @@
-# REQUIREMENTS:
-# pip install -r requirements.txt
-# pip install -U segmentation-models-pytorch timm
+'''
+Requirements:
+pip install -r requirements.txt
+'''
 
-# DATASET:
-# git lfs install
-# git clone https://huggingface.co/datasets/benediktkol/DDOS ./data/DDOS
-# OR
-# pip install --upgrade huggingface_hub
-# hf download benediktkol/DDOS \
-#   --repo-type dataset \
-#   --local-dir ./data/DDOS \
-#   --include "data/*/neighbourhood/0/*" \
-#   --exclude "data/*/neighbourhood/[1-9]*/*"
+'''
+Dataset:
+git lfs install
+git clone https://huggingface.co/datasets/benediktkol/DDOS ./data/DDOS
+OR
+pip install --upgrade huggingface_hub
+hf download benediktkol/DDOS \
+   --repo-type dataset \
+   --local-dir ./data/DDOS \
+   --include "data/*/neighbourhood/0/*" \
+   --exclude "data/*/neighbourhood/[1-9]*/*"
+'''
 
 '''
 Fast Experiment:
-rm -rf checkpoints_check results_check visualizations_check
+rm -rf checkpoints_check outputs_check visualizations_check
 python main.py \
   --modality all \
   --model all \
@@ -29,7 +32,7 @@ python main.py \
   --batch_size 2 \
   --learning_rate 5e-4 \
   --checkpoint_dir checkpoints_check \
-  --results_dir results_check \
+  --outputs_dir outputs_check \
   --visualize_max 50 \
   --visualization_dir visualizations_check \
   --seed 42 \
@@ -38,7 +41,7 @@ python main.py \
 
 '''
 Full Experiment:
-rm -rf checkpoints results visualizations
+rm -rf checkpoints outputs visualizations
 python main.py \
   --modality all \
   --model all \
@@ -52,7 +55,7 @@ python main.py \
   --batch_size 16 \
   --learning_rate 5e-4 \
   --checkpoint_dir checkpoints \
-  --results_dir results \
+  --outputs_dir outputs \
   --visualize_max all \
   --visualization_dir visualizations \
   --seed 42 \
@@ -62,14 +65,14 @@ python main.py \
 import os
 import argparse
 import random
-import csv
 import numpy
 import torch
 
 from src.train import train_model
 from src.test import test_model, summarize_results
-from src.dataset import export_dataset_class_statistics
+from src.dataset import export_dataset_class_distribution
 from src.model import validate_model_availability
+from src.output import append_csv_row, csv_path, ensure_outputs_structure
 
 
 SUPPORTED_MODELS = [
@@ -140,14 +143,13 @@ def set_global_seed(seed):
         pass
 
 
-def write_run_metadata(path, row):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    exists = os.path.exists(path)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
+METADATA_FIELDS = [
+    "run_name", "run_index", "seed", "deterministic", "device", "dataset_path",
+    "train_path", "validation_path", "test_path", "models", "modalities",
+    "epochs", "batch_size", "learning_rate", "class_weight_max", "edge_method",
+    "outputs_dir", "checkpoint_dir", "visualization_dir", "visualize",
+    "visualize_max", "checkpoint_selection_metric", "checkpoint_type",
+]
 
 
 if __name__ == "__main__":
@@ -171,10 +173,10 @@ if __name__ == "__main__":
                         help="Batch size for training, validation, and testing.")
     parser.add_argument("--learning_rate", type=float, required=True,
                         help="Learning rate for Adam optimizer.")
-    parser.add_argument("--results_dir", type=str, required=True,
-                        help="Directory for CSV results and analysis files.")
     parser.add_argument("--checkpoint_dir", type=str, required=True,
-                        help="Directory for model checkpoints.")
+                        help="Directory for best-validation checkpoints.")
+    parser.add_argument("--outputs_dir", type=str, required=True,
+                        help="Directory for structured CSV output.")
     parser.add_argument("--visualization_dir", type=str, required=True,
                         help="Directory for visualization images.")
     parser.add_argument("--visualize_max", type=parse_visualize_max, required=True,
@@ -183,8 +185,6 @@ if __name__ == "__main__":
                         help="Base random seed for reproducibility.")
     parser.add_argument("--runs", type=int, required=True,
                         help="Number of repeated runs. Seeds are seed, seed+1, ...")
-    parser.add_argument("--export_class_stats", action="store_true",
-                        help="Export class-frequency tables for train/validation/test splits before experiments.")
     args = parser.parse_args()
 
     if not args.train and not args.test:
@@ -200,15 +200,8 @@ if __name__ == "__main__":
     if args.runs <= 0:
         parser.error("--runs must be positive.")
 
-    if args.modality == "all":
-        modalities = list(ALL_MODALITIES)
-    else:
-        modalities = [args.modality]
-
-    if args.model == "all":
-        models = list(ALL_MODELS)
-    else:
-        models = [args.model]
+    modalities = list(ALL_MODALITIES) if args.modality == "all" else [args.modality]
+    models = list(ALL_MODELS) if args.model == "all" else [args.model]
 
     # Fail before any long training starts if an optional model is unavailable.
     validate_model_availability(models)
@@ -218,14 +211,17 @@ if __name__ == "__main__":
     validation_path = os.path.join(dataset_path, "validation")
     test_path = os.path.join(dataset_path, "test")
 
-    os.makedirs(args.results_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.visualization_dir, exist_ok=True)
+    ensure_outputs_structure(args.outputs_dir)
 
-    if args.export_class_stats:
-        export_dataset_class_statistics(train_path, os.path.join(args.results_dir, "class_frequency_train.csv"))
-        export_dataset_class_statistics(validation_path, os.path.join(args.results_dir, "class_frequency_validation.csv"))
-        export_dataset_class_statistics(test_path, os.path.join(args.results_dir, "class_frequency_test.csv"))
+    # Generate one combined class-distribution CSV for paper/debugging.
+    export_dataset_class_distribution(
+        {"train": train_path, "validation": validation_path, "test": test_path},
+        csv_path(args.outputs_dir, "results", "class_distribution.csv"),
+        modality="rgb",
+        edge_method=args.edge_method,
+    )
 
     for run_idx in range(args.runs):
         run_seed = args.seed + run_idx
@@ -233,25 +229,30 @@ if __name__ == "__main__":
 
         if args.runs == 1:
             run_name = f"run_01_seed_{run_seed}"
-            run_results_dir = args.results_dir
+            run_outputs_dir = args.outputs_dir
             run_checkpoint_dir = args.checkpoint_dir
             run_visualization_dir = args.visualization_dir
         else:
             run_name = f"run_{run_idx + 1:02d}_seed_{run_seed}"
-            run_results_dir = os.path.join(args.results_dir, run_name)
+            run_outputs_dir = os.path.join(args.outputs_dir, run_name)
             run_checkpoint_dir = os.path.join(args.checkpoint_dir, run_name)
             run_visualization_dir = os.path.join(args.visualization_dir, run_name)
+            ensure_outputs_structure(run_outputs_dir)
+            os.makedirs(run_checkpoint_dir, exist_ok=True)
+            os.makedirs(run_visualization_dir, exist_ok=True)
 
-        os.makedirs(run_results_dir, exist_ok=True)
-        os.makedirs(run_checkpoint_dir, exist_ok=True)
-        os.makedirs(run_visualization_dir, exist_ok=True)
         print(f"\n=== Run {run_idx + 1}/{args.runs} | seed={run_seed} | deterministic=1 ===")
 
-        write_run_metadata(os.path.join(run_results_dir, "run_metadata.csv"), {
+        append_csv_row(csv_path(run_outputs_dir, "metadata", "metadata.csv"), {
             "run_name": run_name,
             "run_index": run_idx + 1,
             "seed": run_seed,
             "deterministic": 1,
+            "device": args.device,
+            "dataset_path": dataset_path,
+            "train_path": train_path,
+            "validation_path": validation_path,
+            "test_path": test_path,
             "models": ";".join(models),
             "modalities": ";".join(modalities),
             "epochs": args.epochs,
@@ -259,11 +260,14 @@ if __name__ == "__main__":
             "learning_rate": args.learning_rate,
             "class_weight_max": CLASS_WEIGHT_MAX,
             "edge_method": args.edge_method,
-            "results_dir": run_results_dir,
+            "outputs_dir": run_outputs_dir,
             "checkpoint_dir": run_checkpoint_dir,
             "visualization_dir": run_visualization_dir,
+            "visualize": int(args.visualize),
             "visualize_max": "all" if args.visualize_max < 0 else args.visualize_max,
-        })
+            "checkpoint_selection_metric": "validation_TSE",
+            "checkpoint_type": "best_validation_checkpoint",
+        }, fieldnames=METADATA_FIELDS)
 
         for model in models:
             for modality in modalities:
@@ -278,7 +282,7 @@ if __name__ == "__main__":
                                 epochs=args.epochs,
                                 batch_size=args.batch_size,
                                 learning_rate=args.learning_rate,
-                                results_dir=run_results_dir,
+                                outputs_dir=run_outputs_dir,
                                 checkpoint_dir=run_checkpoint_dir,
                                 class_weight_max=CLASS_WEIGHT_MAX,
                                 seed=run_seed,
@@ -291,14 +295,14 @@ if __name__ == "__main__":
                                checkpoint_path=checkpoint_path,
                                batch_size=args.batch_size,
                                visualize=args.visualize,
-                               results_dir=run_results_dir,
+                               outputs_dir=run_outputs_dir,
                                visualization_dir=run_visualization_dir,
                                visualize_max=args.visualize_max,
                                seed=run_seed,
                                run_name=run_name)
 
         if args.test:
-            summarize_results(run_results_dir)
+            summarize_results(run_outputs_dir)
 
     if args.test and args.runs > 1:
-        summarize_results(args.results_dir)
+        summarize_results(args.outputs_dir)
