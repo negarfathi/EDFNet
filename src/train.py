@@ -28,7 +28,7 @@ def get_inference_timer(device):
 
 
 def save_checkpoint(path, model, model_name, modality, num_classes, in_channels, train_dataset,
-                    epoch, best_val_tse, normalization, ignore_index,
+                    epoch, best_val_tocs, normalization, ignore_index,
                     class_weight_max=None, seed=None, run_name=None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
@@ -41,7 +41,7 @@ def save_checkpoint(path, model, model_name, modality, num_classes, in_channels,
         "class_names": list(CLASS_NAMES),
         "class_to_index": dict(train_dataset.class_to_index),
         "best_epoch": epoch,
-        "best_val_tse": best_val_tse,
+        "best_val_tocs": best_val_tocs,
         "normalization": normalization,
         "ignore_index": ignore_index,
         "class_weights": list(train_dataset.class_weights),
@@ -50,14 +50,14 @@ def save_checkpoint(path, model, model_name, modality, num_classes, in_channels,
         "seed": seed,
         "run_name": run_name,
         "checkpoint_type": "best_validation_checkpoint",
-        "checkpoint_selection_metric": "validation_TSE",
+        "checkpoint_selection_metric": "validation_TOCS",
     }, path)
 
 
 VALIDATION_HISTORY_FIELDS = [
     "model", "pretrained", "modality", "run_name", "seed", "epoch",
     "train_loss", "val_miou", "val_biou", "val_recall", "val_precision",
-    "val_fpr", "val_tse", "val_fps", "val_latency_ms", "train_time_s",
+    "val_fpr", "val_tocs", "val_fps", "val_latency_ms", "train_time_s",
     "val_wall_time_s", "peak_gpu_train_mb", "peak_gpu_val_mb", "is_best",
     "checkpoint_saved", "normalization", "class_weight_max",
 ]
@@ -111,7 +111,7 @@ def train_model(train_path, validation_path, modality, model_name, device, edge_
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_{modality}.pth")
-    best_val_tse = -float("inf")
+    best_val_tocs = -float("inf")
     best_epoch = 0
     sync = get_inference_timer(device)
 
@@ -169,15 +169,15 @@ def train_model(train_path, validation_path, modality, model_name, device, edge_
         )
 
         mean_metrics = accumulator.compute()
-        tse = mean_metrics["tse"]
-        is_best = bool(numpy.isfinite(tse) and tse > best_val_tse)
+        tocs = mean_metrics["tocs"]
+        is_best = bool(numpy.isfinite(tocs) and tocs > best_val_tocs)
         checkpoint_saved = 0
         if is_best:
-            best_val_tse = tse
+            best_val_tocs = tocs
             best_epoch = epoch + 1
             save_checkpoint(
                 checkpoint_path, model, model_name, modality, num_classes, in_channels,
-                train_dataset, epoch + 1, best_val_tse, normalization, train_dataset.ignore_index,
+                train_dataset, epoch + 1, best_val_tocs, normalization, train_dataset.ignore_index,
                 class_weight_max=class_weight_max, seed=seed, run_name=run_name
             )
             checkpoint_saved = 1
@@ -190,7 +190,7 @@ def train_model(train_path, validation_path, modality, model_name, device, edge_
             f"Epoch [{epoch+1:>2}/{epochs}] | Loss: {avg_loss:.5f} | "
             f"Validation => mIoU: {mean_metrics['miou']:.5f} | bIoU: {mean_metrics['biou']:.5f} | "
             f"Recall: {mean_metrics['recall']:.5f} | Precision: {mean_metrics['precision']:.5f} | "
-            f"FPR: {mean_metrics['fpr']:.5f} | TSE: {tse:.5f} | "
+            f"FPR: {mean_metrics['fpr']:.5f} | TOCS: {tocs:.5f} | "
             f"per-class IoU: [{per_class_str}] | Inference FPS: {fps:>5.2f} | "
             f"Inference Latency: {latency*1000:>7.2f} ms | best={is_best}"
         )
@@ -208,7 +208,7 @@ def train_model(train_path, validation_path, modality, model_name, device, edge_
             "val_recall": maybe_float_for_csv(mean_metrics["recall"]),
             "val_precision": maybe_float_for_csv(mean_metrics["precision"]),
             "val_fpr": maybe_float_for_csv(mean_metrics["fpr"]),
-            "val_tse": maybe_float_for_csv(tse),
+            "val_tocs": maybe_float_for_csv(tocs),
             "val_fps": maybe_float_for_csv(fps),
             "val_latency_ms": maybe_float_for_csv(latency * 1000),
             "train_time_s": maybe_float_for_csv(train_time),
@@ -222,15 +222,15 @@ def train_model(train_path, validation_path, modality, model_name, device, edge_
         }, fieldnames=VALIDATION_HISTORY_FIELDS)
 
     if best_epoch == 0:
-        # Fallback if validation TSE was never finite.
+        # Fallback if validation TOCS was never finite.
         save_checkpoint(
             checkpoint_path, model, model_name, modality, num_classes, in_channels,
-            train_dataset, epochs, best_val_tse, normalization, train_dataset.ignore_index,
+            train_dataset, epochs, best_val_tocs, normalization, train_dataset.ignore_index,
             class_weight_max=class_weight_max, seed=seed, run_name=run_name
         )
         best_epoch = epochs
 
-    finite_best = int(numpy.isfinite(best_val_tse))
+    finite_best = int(numpy.isfinite(best_val_tocs))
     append_csv_row(csv_path(outputs_dir, "debug", "checks.csv"), {
         "stage": "train",
         "model": model_name,
@@ -256,6 +256,6 @@ def train_model(train_path, validation_path, modality, model_name, device, edge_
         "message": "",
     }, fieldnames=CHECK_FIELDS)
 
-    print(f"[INFO] Best model saved as: {checkpoint_path} (epoch={best_epoch}, val_tse={best_val_tse:.6f})")
+    print(f"[INFO] Best model saved as: {checkpoint_path} (epoch={best_epoch}, val_tocs={best_val_tocs:.6f})")
     print(f"[INFO] Validation history updated: {csv_path(outputs_dir, 'debug', 'validation_history.csv')}\n")
     return model

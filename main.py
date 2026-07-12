@@ -265,7 +265,7 @@ if __name__ == "__main__":
             "visualization_dir": run_visualization_dir,
             "visualize": int(args.visualize),
             "visualize_max": "all" if args.visualize_max < 0 else args.visualize_max,
-            "checkpoint_selection_metric": "validation_TSE",
+            "checkpoint_selection_metric": "validation_TOCS",
             "checkpoint_type": "best_validation_checkpoint",
         }, fieldnames=METADATA_FIELDS)
 

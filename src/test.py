@@ -45,8 +45,56 @@ def safe_nanmean(values):
     return float(numpy.nanmean(values))
 
 
-def compute_tse(miou, biou, recall, fpr):
-    return 0.45 * biou + 0.30 * recall - 0.15 * fpr + 0.10 * miou
+def is_finite_number(value):
+    try:
+        return bool(numpy.isfinite(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def compute_f2_score(precision, recall, epsilon=1e-12):
+    """Compute F2, emphasizing recall twice as much as precision."""
+    p_finite = is_finite_number(precision)
+    r_finite = is_finite_number(recall)
+
+    # If a class is present but never predicted, precision is undefined and recall is 0.
+    # For detection quality, this should contribute 0 rather than NaN.
+    if not p_finite and r_finite:
+        return 0.0 if float(recall) <= 0.0 else float("nan")
+    if p_finite and not r_finite:
+        return 0.0 if float(precision) <= 0.0 else float("nan")
+    if not p_finite and not r_finite:
+        return float("nan")
+
+    precision = float(precision)
+    recall = float(recall)
+    denominator = 4.0 * precision + recall
+    if denominator <= epsilon:
+        return 0.0
+    return float((5.0 * precision * recall) / (denominator + epsilon))
+
+
+def compute_tocs_from_components(mean_thin_iou, mean_thin_f2, biou, miou, mean_thin_precision):
+    """
+    Thin-Obstacle Composite Score (TOCS).
+
+    TOCS is a task-oriented ranking score for thin-obstacle segmentation:
+      0.35 * mean thin IoU
+    + 0.30 * mean thin F2
+    + 0.20 * boundary IoU
+    + 0.10 * mean IoU
+    + 0.05 * mean thin precision
+    """
+    components = [mean_thin_iou, mean_thin_f2, biou, miou, mean_thin_precision]
+    if not all(is_finite_number(value) for value in components):
+        return float("nan")
+    return float(
+        0.35 * mean_thin_iou
+        + 0.30 * mean_thin_f2
+        + 0.20 * biou
+        + 0.10 * miou
+        + 0.05 * mean_thin_precision
+    )
 
 
 def maybe_float_for_csv(value):
@@ -142,7 +190,40 @@ class SegmentationMetricAccumulator:
         precision = safe_nanmean(per_class_precision)
         fpr = safe_nanmean(per_class_fpr)
         biou = safe_nanmean(per_class_biou)
-        tse = compute_tse(miou, biou, recall, fpr)
+
+        per_class_f2 = numpy.array([
+            compute_f2_score(p, r) for p, r in zip(per_class_precision, per_class_recall)
+        ], dtype=numpy.float64)
+        thin_indices = [idx for idx in get_thin_class_indices() if idx < self.num_classes]
+        thin_iou_values = [per_class_iou[idx] for idx in thin_indices]
+        thin_precision_values = [per_class_precision[idx] for idx in thin_indices]
+        thin_f2_values = [per_class_f2[idx] for idx in thin_indices]
+
+        # For the TOCS precision term, an undefined precision caused by no predicted
+        # pixels for a present thin class is treated as 0. This keeps TOCS finite
+        # for conservative models that miss thin objects entirely.
+        thin_precision_for_tocs = []
+        for idx in thin_indices:
+            p = per_class_precision[idx]
+            r = per_class_recall[idx]
+            if is_finite_number(p):
+                thin_precision_for_tocs.append(float(p))
+            elif is_finite_number(r):
+                thin_precision_for_tocs.append(0.0)
+            else:
+                thin_precision_for_tocs.append(float("nan"))
+
+        mean_thin_iou = safe_nanmean(thin_iou_values)
+        mean_thin_precision = safe_nanmean(thin_precision_values)
+        mean_thin_precision_for_tocs = safe_nanmean(thin_precision_for_tocs)
+        mean_thin_f2 = safe_nanmean(thin_f2_values)
+        tocs = compute_tocs_from_components(
+            mean_thin_iou=mean_thin_iou,
+            mean_thin_f2=mean_thin_f2,
+            biou=biou,
+            miou=miou,
+            mean_thin_precision=mean_thin_precision_for_tocs,
+        )
 
         return {
             "miou": miou,
@@ -155,7 +236,12 @@ class SegmentationMetricAccumulator:
             "recall": recall,
             "precision": precision,
             "fpr": fpr,
-            "tse": tse,
+            "mean_thin_iou": mean_thin_iou,
+            "mean_thin_f2": mean_thin_f2,
+            "mean_thin_precision": mean_thin_precision,
+            "mean_thin_precision_for_tocs": mean_thin_precision_for_tocs,
+            "per_class_f2": [float(x) if not numpy.isnan(x) else float("nan") for x in per_class_f2],
+            "tocs": tocs,
             "tp": [int(x) for x in tp],
             "fp": [int(x) for x in fp],
             "fn": [int(x) for x in fn],
@@ -223,7 +309,7 @@ def compute_sample_error_rows(predictions, labels, metadata, num_classes, ignore
         paper_candidate_score = int(thin_fn + thin_fp)
         if paper_candidate_score > 0:
             candidate_type = "thin_error_case"
-        elif metrics["tse"] >= 0.75:
+        elif is_finite_number(metrics["tocs"]) and metrics["tocs"] >= 0.75:
             candidate_type = "success_case"
         else:
             candidate_type = "typical_or_failure_case"
@@ -241,7 +327,7 @@ def compute_sample_error_rows(predictions, labels, metadata, num_classes, ignore
             "recall": maybe_float_for_csv(metrics["recall"]),
             "precision": maybe_float_for_csv(metrics["precision"]),
             "fpr": maybe_float_for_csv(metrics["fpr"]),
-            "tse": maybe_float_for_csv(metrics["tse"]),
+            "tocs": maybe_float_for_csv(metrics["tocs"]),
             "thin_iou": maybe_float_for_csv(safe_nanmean(thin_iou_values)),
             "ultra_thin_iou": maybe_float_for_csv(metrics["per_class_iou"][thin_indices[-1]] if thin_indices else float("nan")),
             "thin_recall": maybe_float_for_csv(safe_nanmean(thin_recall_values)),
@@ -260,9 +346,9 @@ def compute_sample_error_rows(predictions, labels, metadata, num_classes, ignore
 
 
 OVERALL_FIELDS = [
-    "rank_by_tse", "model", "pretrained", "modality", "run_name", "seed", "checkpoint_epoch",
-    "miou", "biou", "recall", "precision", "fpr", "fps", "latency_ms", "tse",
-    "eval_wall_time_s", "best_val_tse", "normalization", "class_weight_max",
+    "rank_by_tocs", "model", "pretrained", "modality", "run_name", "seed", "checkpoint_epoch",
+    "miou", "biou", "recall", "precision", "fpr", "fps", "latency_ms", "tocs",
+    "eval_wall_time_s", "best_val_tocs", "normalization", "class_weight_max",
 ]
 
 PER_CLASS_FIELDS = [
@@ -276,13 +362,14 @@ THIN_FIELDS = [
     "thin_structures_iou", "ultra_thin_iou", "mean_thin_iou",
     "thin_structures_recall", "ultra_thin_recall", "mean_thin_recall",
     "thin_structures_precision", "ultra_thin_precision", "mean_thin_precision",
+    "thin_structures_f2", "ultra_thin_f2", "mean_thin_f2",
     "thin_structures_fpr", "ultra_thin_fpr", "mean_thin_fpr",
     "thin_gt_pixels", "ultra_thin_gt_pixels",
 ]
 
 ERROR_FIELDS = [
     "model", "pretrained", "modality", "run_name", "seed", "sample_key", "image_path",
-    "miou", "biou", "recall", "precision", "fpr", "tse",
+    "miou", "biou", "recall", "precision", "fpr", "tocs",
     "thin_iou", "ultra_thin_iou", "thin_recall", "thin_precision",
     "thin_tp_pixels", "thin_fp_pixels", "thin_fn_pixels",
     "worst_class_name", "worst_class_iou",
@@ -355,6 +442,13 @@ def thin_row_from_metrics(metrics, model_name, modality, seed, run_name):
         "thin_structures_precision": maybe_float_for_csv(metrics["per_class_precision"][thin_struct_idx]),
         "ultra_thin_precision": maybe_float_for_csv(metrics["per_class_precision"][ultra_idx]),
         "mean_thin_precision": maybe_float_for_csv(safe_nanmean(metric_list("per_class_precision"))),
+        "thin_structures_f2": maybe_float_for_csv(compute_f2_score(
+            metrics["per_class_precision"][thin_struct_idx], metrics["per_class_recall"][thin_struct_idx]
+        )),
+        "ultra_thin_f2": maybe_float_for_csv(compute_f2_score(
+            metrics["per_class_precision"][ultra_idx], metrics["per_class_recall"][ultra_idx]
+        )),
+        "mean_thin_f2": maybe_float_for_csv(metrics["mean_thin_f2"]),
         "thin_structures_fpr": maybe_float_for_csv(metrics["per_class_fpr"][thin_struct_idx]),
         "ultra_thin_fpr": maybe_float_for_csv(metrics["per_class_fpr"][ultra_idx]),
         "mean_thin_fpr": maybe_float_for_csv(safe_nanmean(metric_list("per_class_fpr"))),
@@ -481,13 +575,13 @@ def test_model(test_path, modality, device, edge_method, checkpoint_path, batch_
         f"Test Results => mean IoU: {mean_metrics['miou']:.5f} | "
         f"per-class IoU: [{per_class_str}] | boundary IoU: {mean_metrics['biou']:.5f} | "
         f"Recall: {mean_metrics['recall']:.5f} | Precision: {mean_metrics['precision']:.5f} | "
-        f"FPR: {mean_metrics['fpr']:.5f} | TSE: {mean_metrics['tse']:.5f} | "
+        f"FPR: {mean_metrics['fpr']:.5f} | TOCS: {mean_metrics['tocs']:.5f} | "
         f"Inference FPS: {inference_fps:>5.2f} | "
         f"Inference Latency: {inference_latency*1000:>7.2f} ms | Eval wall time: {total_wall_time:.2f}s"
     )
 
     result_row = {
-        "rank_by_tse": "",
+        "rank_by_tocs": "",
         "model": model_name,
         "pretrained": model_pretrained_flag(model_name),
         "modality": modality,
@@ -501,9 +595,9 @@ def test_model(test_path, modality, device, edge_method, checkpoint_path, batch_
         "fpr": maybe_float_for_csv(mean_metrics["fpr"]),
         "fps": maybe_float_for_csv(mean_metrics["fps"]),
         "latency_ms": maybe_float_for_csv(mean_metrics["latency_ms"]),
-        "tse": maybe_float_for_csv(mean_metrics["tse"]),
+        "tocs": maybe_float_for_csv(mean_metrics["tocs"]),
         "eval_wall_time_s": maybe_float_for_csv(mean_metrics["eval_wall_time_s"]),
-        "best_val_tse": maybe_float_for_csv(checkpoint.get("best_val_tse", "")),
+        "best_val_tocs": maybe_float_for_csv(checkpoint.get("best_val_tocs", "")),
         "normalization": normalization,
         "class_weight_max": checkpoint.get("class_weight_max", ""),
     }
@@ -519,7 +613,7 @@ def test_model(test_path, modality, device, edge_method, checkpoint_path, batch_
 
     finite_values = [
         mean_metrics["miou"], mean_metrics["biou"], mean_metrics["recall"],
-        mean_metrics["precision"], mean_metrics["fpr"], mean_metrics["tse"],
+        mean_metrics["precision"], mean_metrics["fpr"], mean_metrics["tocs"],
     ]
     all_metrics_finite = int(all(numpy.isfinite(v) for v in finite_values))
     append_csv_row(csv_path(outputs_dir, "debug", "checks.csv"), {
@@ -566,7 +660,7 @@ def _best_row(rows, field, lower=False):
 
 
 def _group_summary(rows, group_field, counterpart_field):
-    numeric_fields = ["miou", "biou", "tse", "fps", "latency_ms"]
+    numeric_fields = ["miou", "biou", "tocs", "fps", "latency_ms"]
     summary_rows = []
     groups = {}
     for row in rows:
@@ -608,9 +702,9 @@ def summarize_results(outputs_dir="outputs"):
     if not rows:
         return
 
-    rows_sorted = sorted(rows, key=lambda r: safe_float(r.get("tse"), -float("inf")), reverse=True)
+    rows_sorted = sorted(rows, key=lambda r: safe_float(r.get("tocs"), -float("inf")), reverse=True)
     for rank, row in enumerate(rows_sorted, start=1):
-        row["rank_by_tse"] = rank
+        row["rank_by_tocs"] = rank
     write_csv(overall_path, rows_sorted, fieldnames=OVERALL_FIELDS)
 
     thin_rows = read_csv(thin_path)
