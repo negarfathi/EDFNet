@@ -333,7 +333,7 @@ This command runs experiments using the following seeds:
 
 This repository is based on the following work:
 
-N. Fathi, “EDFNet: Early Fusion of Edge and Depth for Thin-Obstacle Segmentation in UAV Navigation,” *arXiv preprint* [arXiv:2604.09694](https://arxiv.org/abs/2604.09694), 2026.
+N. Fathi, “EDFNet: Early Fusion of Edge and Depth for Thin-Obstacle Segmentation in UAV Navigation,” *arXiv preprint* [arXiv:2604.09694](https://doi.org/10.48550/arXiv.2604.09694), 2026.
 
 Artifact archive:
 
