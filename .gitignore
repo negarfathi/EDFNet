@@ -3,5 +3,4 @@ __pycache__/
 *.py[cod]
 /data/
 /checkpoints/
-/outputs/
 /visualizations/
