@@ -1,0 +1,5 @@
+modality,num_models,mean_miou,std_miou,best_miou,best_miou_model,mean_biou,std_biou,best_biou,best_biou_model,mean_tocs,std_tocs,best_tocs,best_tocs_model,mean_fps,std_fps,best_fps,best_fps_model,mean_latency_ms,std_latency_ms,best_latency_ms,best_latency_ms_model,mean_thin_iou,best_thin_iou,best_thin_iou_model
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,
